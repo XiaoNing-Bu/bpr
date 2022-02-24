@@ -170,11 +170,10 @@ if __name__ == "__main__":
     logger.info("Loading QA pairs from %s", args.qa_file)
     with open(args.qa_file) as f:
         qa_pairs = [(row[0], eval(row[1].strip())) for row in csv.reader(f, delimiter="\t")]
+    qa_pairs = qa_pairs[:args.chunk_size]
     total_count = len(qa_pairs)
 
-    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    qa_pairs = qa_pairs[:10]
-    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
 
     logger.info("Computing query embeddings...")
     queries = [pair[0] for pair in qa_pairs]

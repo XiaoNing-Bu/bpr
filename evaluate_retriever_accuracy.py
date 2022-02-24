@@ -18,12 +18,13 @@ import numpy as np
 import regex
 from torch.nn.parallel import DataParallel
 from tqdm import tqdm
-
+import statistics
 import bpr.index
 from bpr.biencoder import BiEncoder
 from bpr.index import FaissBinaryIndex, FaissIndex, FaissHNSWIndex
 from bpr.passage_db import PassageDB
 from bpr.retriever import Retriever
+from transformers import DPRReader, DPRReaderTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,17 @@ NON_WS = r"[^\p{Z}\p{C}]"
 # https://github.com/facebookresearch/DPR/blob/f403c3b3e179e53c0fe68a0718d5dc25371fe5df/dpr/utils/tokenizers.py#L163
 REGEXP = regex.compile("(%s)|(%s)" % (ALPHA_NUM, NON_WS), flags=regex.IGNORECASE + regex.UNICODE + regex.MULTILINE)
 
-
+class Timer:
+    def __init__(self):
+        self.starter = torch.cuda.Event(enable_timing=True)
+        self.ender = torch.cuda.Event(enable_timing=True)
+    def start(self):
+        self.starter.record()
+    def end(self):
+        self.ender.record()
+        torch.cuda.synchronize()
+        elapsed = self.starter.elapsed_time(self.ender)
+        return elapsed
 
 def _has_answer(answer: str, passage: str) -> bool:
     def tokenize(text: str) -> List[str]:
@@ -71,8 +82,9 @@ if __name__ == "__main__":
     parser.add_argument("--index_device", type=str, default="cpu", choices=["cuda", "cpu"])
     parser.add_argument("--parallel", action="store_true")
     parser.add_argument("--pool_size", type=int, default=multiprocessing.cpu_count())
-    parser.add_argument("--chunk_size", type=int, default=32)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--chunk_size", type=int, default=512)
+    parser.add_argument("--retriever_batch_size", type=int, default=32)
+    parser.add_argument("--reader_batch_size", type=int, default=100)
 
     args = parser.parse_args()
     logging.basicConfig(
@@ -97,6 +109,9 @@ if __name__ == "__main__":
             passage_dicts.append(passage_dict)
 
         return dict(question=query, answers=answers, ctxs=passage_dicts)
+
+    tokenizer = DPRReaderTokenizer.from_pretrained('facebook/dpr-reader-single-nq-base')
+    model = DPRReader.from_pretrained('facebook/dpr-reader-single-nq-base').to(torch.device("cuda"))
 
     passage_db = PassageDB(args.passage_db_file)
     embedding_data = joblib.load(args.embedding_file, mmap_mode="r")
@@ -157,58 +172,122 @@ if __name__ == "__main__":
         qa_pairs = [(row[0], eval(row[1].strip())) for row in csv.reader(f, delimiter="\t")]
     total_count = len(qa_pairs)
 
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    qa_pairs = qa_pairs[:10]
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
     logger.info("Computing query embeddings...")
     queries = [pair[0] for pair in qa_pairs]
+    encoding_timer = Timer()
+    encoding_timer.start()
     query_embeddings = retriever.encode_queries(queries)
+    logger.info("complete! time took:%f per query, %d queries in total",encoding_timer.end()/total_count,total_count)
 
-    def iterator(query_embeddings, qa_pairs, batch_size=args.batch_size):
-        """Yield successive n-sized chunks from lst."""
-        for i in range(0, len(query_embeddings-batch_size), batch_size):
-            yield (query_embeddings[i:i + batch_size],qa_pairs[i:i + batch_size])
+    def iterator(batch_size, *args):
+        for i in range(0, len(args[0])-batch_size+1, batch_size):
+            yield (arg[i:i + batch_size] for arg in args)
+
+    search_latencies = []
+    preprocess_latencies = []
+    answer_extract_latencies = []
+    postprocess_latencies = []
+    total_latencies = []
+    retriever_memories = []
+    reader_memories = []
+
+    #------------timers---------------
+    search_timer = Timer()
+    preprocess_timer = Timer()
+    answer_extracting_timer = Timer()
+    postprocess_timer = Timer()
+    encoding_timer = Timer()
+    total_latency_timer = Timer()
+    MB = (1024.0 * 1024.0)
 
     logger.info("Getting top-k results...")
 
-    #if args.output_file:
-    #with open(args.output_file, "w") as file:
-    total_correct_counts = defaultdict(int)
-    for batch in iterator(query_embeddings, qa_pairs):
-        start_time = time.time()
+
+    start_time = time.time()
+    for query_embedding, questiona in iterator(args.retriever_batch_size, query_embeddings, qa_pairs):
+        torch.cuda.reset_max_memory_allocated()
+        start = torch.cuda.max_memory_allocated() / MB
+        print(start)
+        total_latency_timer.start()
+
+        search_timer.start()
+        print(query_embedding.shape)
         if isinstance(index, FaissBinaryIndex):
             topk_results = retriever.search(
-                batch[0], max(args.top_k), binary_k=args.binary_k, rerank=not args.binary_no_rerank
+                query_embedding, max(args.top_k), binary_k=args.binary_k, rerank=not args.binary_no_rerank
             )
         else:
-            topk_results = retriever.search(batch[0], max(args.top_k))
-        query_time = time.time() - start_time
+            topk_results = retriever.search(query_embedding, max(args.top_k))
+        query_time = search_timer.end()
+        search_latencies.append(query_time)
         logger.info("Elapsed time: %.2fsec", query_time)
-        logger.info("Queries per sec: %.2f", total_count / query_time)
+        print(torch.cuda.max_memory_allocated()/MB)
+        size = (torch.cuda.max_memory_allocated()/MB) - start
+        retriever_memories.append(size)
+        print(size)
 
-        logger.info("Computing evaluation metrics...")
 
-        correct_counts = defaultdict(int)
-        output_examples = []
-        with tqdm(total=len(batch[1])) as pbar:
-            with closing(multiprocessing.Pool(args.pool_size)) as pool:
-                for example in pool.imap(process_candidates, zip(batch[1], topk_results), chunksize=args.chunk_size):
-                    output_examples.append(example)
-                    for i, passage_dict in enumerate(example["ctxs"]):
-                        if passage_dict["has_answer"]:
-                            for top_k in args.top_k:
-                                if i < top_k:
-                                    correct_counts[top_k] += 1
-                            break
+        torch.cuda.reset_max_memory_allocated()
+        start = torch.cuda.max_memory_allocated() / MB
+        texts = []
+        reader_questions = []
+        titles = []
+        ground_truth_answers = []
+        for result,qa in zip(topk_results,questiona):
+            for x in result:
+                reader_questions.append(qa[0])
+                titles.append(x.passage.title)
+                texts.append(x.passage.text)
+                ground_truth_answers.append(qa[1])
+        for reader_questions,titles,texts,ground_truth_answers in iterator(args.reader_batch_size,reader_questions,titles,texts,ground_truth_answers):
+            answers = []
+            preprocess_timer.start()
+            input_id = tokenizer(questions=reader_questions,
+                                 titles=titles,
+                                 texts=texts,
+                                 return_tensors='pt',padding=True)["input_ids"]
+            x = preprocess_timer.end()
+            preprocess_latencies.append(x)
+            #------------------------------------answer extraction-----------------------------------------------------
+            answer_extracting_timer.start()
+            input_id = torch.tensor(input_id).to(torch.device("cuda"))
+            print(len(input_id))
+            with torch.no_grad():
+                outputs = model(input_id)
+                start_logits = outputs.start_logits
+                end_logits = outputs.end_logits
 
-                    pbar.update()
+            x = answer_extracting_timer.end()
+            answer_extract_latencies.append(x)
 
-        if not args.no_eval:
-            logger.info("#total examples: %d", args.batch_size)
-            for top_k in args.top_k:
-                precision = correct_counts[top_k] / args.batch_size
-                total_correct_counts[top_k]+=correct_counts[top_k]
-                logger.info("precision@%d:%f correct_samples:%d", top_k, precision, correct_counts[top_k])
-    if not args.no_eval:
-        logger.info("#total examples: %d", total_count)
-        for top_k in args.top_k:
-            precision = total_correct_counts[top_k] / total_count
-            logger.info("precision@%d:%f correct_samples:%d", top_k, precision, total_correct_counts[top_k])
+            postprocess_timer.start()
+            #print out the result
+            answer_start = torch.argmax(start_logits, axis = 1)
+            answer_end = torch.argmax(end_logits, axis = 1)
+            # Combine the tokens in the answer and print it out.
+            for i in range(input_id.shape[0]):
+                answers.append(' '.join(tokenizer.convert_ids_to_tokens(list(input_id[i][answer_start[i]:answer_end[i]+1]))))
+            x = postprocess_timer.end()
+            postprocess_latencies.append(x)
+            print(answers)
+
+
+        total_latency_time = total_latency_timer.end()
+        total_latencies.append(total_latency_time)
+
+        size = (torch.cuda.max_memory_allocated() / MB) - start
+        reader_memories.append(size)
+        ground_truth_answers = [item for sublist in ground_truth_answers for item in sublist]
+    logger.info("------------------------------latency statistics-------------------------")
+    logger.info("average search latency: %.2f ms",statistics.mean(search_latencies[:]))
+    logger.info("average preprocess latency: %.2f ms",statistics.mean(preprocess_latencies[:]))
+    logger.info("average answer extraction latency: %.2f ms",statistics.mean(answer_extract_latencies[:]))
+    logger.info("average postprocess latency: %.2f ms",statistics.mean(postprocess_latencies[:]))
+    logger.info("average total latency: %.2f ms",statistics.mean(total_latencies[:]))
+    logger.info("-------------------------runtime memory---------------------------------")
+    logger.info("average retriever memories: %.2f ",statistics.mean(retriever_memories[:]))
+    logger.info("average reader memories: %.2f ",statistics.mean(reader_memories[:]))

@@ -25,6 +25,12 @@ from bpr.passage_db import PassageDB
 from bpr.retriever import Retriever
 
 logger = logging.getLogger(__name__)
+"""
+python evaluate_retriever.py --binary_k=1000 
+--biencoder_file=./training_files/bpr_finetuned_nq.ckpt 
+--embedding_file=./training_files/nq_adv_full.emb
+--passage_db_file=./lmdb/data.mdb --qa_file=./data/nq-test.qa.csv --batch_size=32
+"""
 
 # https://github.com/facebookresearch/DPR/blob/f403c3b3e179e53c0fe68a0718d5dc25371fe5df/dpr/utils/tokenizers.py#L154
 ALPHA_NUM = r"[\p{L}\p{N}\p{M}]+"

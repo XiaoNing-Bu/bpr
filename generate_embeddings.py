@@ -10,7 +10,15 @@ from transformers import AutoTokenizer
 
 from bpr.biencoder import BiEncoder
 from bpr.passage_db import PassageDB
-
+"""
+python generate_reader_training_files.py
+--binary_k=1000
+--biencoder_file=./training_files/bpr_finetuned_nq.ckpt
+--embedding_file=./training_files/nq_adv_full.emb
+--passage_db_file=./lmdb/data.mdb
+--qa_file=./data/nq-train.qa.csv
+--batch_size=128 --examples_per_file=512
+"""
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
