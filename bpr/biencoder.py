@@ -127,13 +127,13 @@ class BiEncoder(LightningModule):
 
     @classmethod
     def _collate_fn(
-        cls,
-        batch: list,
-        hparams: Namespace,
-        num_hard_negatives: int,
-        num_other_negatives: int,
-        fold: str,
-        include_passage_label: bool = False,
+            cls,
+            batch: list,
+            hparams: Namespace,
+            num_hard_negatives: int,
+            num_other_negatives: int,
+            fold: str,
+            include_passage_label: bool = False,
     ) -> Dict[str, Union[Dict[str, torch.Tensor], torch.Tensor]]:
         queries = []
         passages = []
@@ -194,7 +194,7 @@ class BiEncoder(LightningModule):
         return ret
 
     def forward(
-        self, query_input: Dict[str, torch.LongTensor], passage_input: Dict[str, torch.LongTensor]
+            self, query_input: Dict[str, torch.LongTensor], passage_input: Dict[str, torch.LongTensor]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         query_repr = self.query_encoder(**query_input)
         passage_repr = self.passage_encoder(**passage_input)
@@ -218,7 +218,7 @@ class BiEncoder(LightningModule):
         return dict(loss=ret["loss"], log={"train_" + k: v for k, v in ret.items()})
 
     def validation_step(
-        self, batch: Dict[str, torch.Tensor], batch_idx: int, dataloader_idx: Optional[int] = None
+            self, batch: Dict[str, torch.Tensor], batch_idx: int, dataloader_idx: Optional[int] = None
     ) -> dict:
         if dataloader_idx == 1:
             label = batch.pop("passage_label")
@@ -314,7 +314,7 @@ class BiEncoder(LightningModule):
         return ret
 
     def _compute_average_rank(
-        self, query_repr: torch.Tensor, passage_repr: torch.Tensor, label: torch.Tensor
+            self, query_repr: torch.Tensor, passage_repr: torch.Tensor, label: torch.Tensor
     ) -> torch.Tensor:
         if self.trainer.local_rank != 0 and not self.hparams.eval_rank_local_gpu:
             return torch.tensor(0.0, device=self.device)

@@ -42,27 +42,20 @@ class Reader(LightningModule):
     def _create_model(self) -> PreTrainedModel:
         config = AutoConfig.from_pretrained(self.hparams.base_pretrained_model)
         base_class = AutoModel.from_config(config).__class__
-
+        """
         class ReaderModel(base_class):
             def __init__(self, config: PretrainedConfig):
                 super().__init__(config)
-                print("!!!!!!!!!!!!!!!!!!!!!!start init!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                 self.qa_outputs = nn.Linear(config.hidden_size, 2)
                 self.qa_classifier = nn.Linear(config.hidden_size, 1)
+
                 self.init_weights()
-                biencoder = BiEncoder.load_from_checkpoint("bpr_finetuned_nq.ckpt", map_location="cuda", strict=False)
-                self.passage_encoder = biencoder.passage_encoder
-                for param in self.passage_encoder.parameters():
-                    param.requires_grad = False
-                print("!!!!!!!!!!!!!!!!!!!!! end init !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
             def forward(
-                    self, input_ids: torch.Tensor, token_type_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs
+                self, input_ids: torch.Tensor, token_type_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs
             ) -> Tuple[torch.Tensor, ...]:
-                print("!!!!!!!!!!!!!!!!!!!!!!start forward!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-                with torch.no_grad():
-                    inputs_embeds = self.passage_encoder(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)
                 outputs = super().forward(
-                    input_ids=inputs_embeds
+                    input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask
                 )
                 sequence_output = outputs[0]
 
@@ -72,8 +65,39 @@ class Reader(LightningModule):
 
                 classifier_feature = sequence_output[:, 0, :]
                 classifier_logits = self.qa_classifier(classifier_feature).squeeze(-1)
-                print("!!!!!!!!!!!!!!!!!!!!!!end forward!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
                 return classifier_logits, start_logits, end_logits
+        """
+        class ReaderModel(base_class):
+            def __init__(self, config: PretrainedConfig):
+                super().__init__(config)
+                print("!!!!!!!!!!!!!!!!!!!!!!start init!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                self.qa_outputs = nn.Linear(config.hidden_size, 2)
+                self.qa_classifier = nn.Linear(config.hidden_size, 1)
+                self.init_weights()
+                biencoder = BiEncoder.load_from_checkpoint("/gscratch/h2lab/xiaonb/bpr/bpr-main/training_files/bpr_finetuned_nq.ckpt", map_location="cuda", strict=False)
+                self.passage_encoder = biencoder.passage_encoder
+                for param in self.passage_encoder.parameters():
+                    param.requires_grad = False
+                print("!!!!!!!!!!!!!!!!!!!!! end init !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            def forward(
+                    self, input_ids: torch.Tensor, token_type_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs
+            ) -> Tuple[torch.Tensor, ...]:
+                with torch.no_grad():
+                    inputs_embeds = self.passage_encoder(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)
+                outputs = super().forward(
+                    inputs_embeds=inputs_embeds
+                )
+                sequence_output = outputs[0]
+
+                start_logits, end_logits = self.qa_outputs(sequence_output).split(1, dim=-1)
+                start_logits = start_logits.squeeze(-1)
+                end_logits = end_logits.squeeze(-1)
+
+                classifier_feature = sequence_output[:, 0, :]
+                classifier_logits = self.qa_classifier(classifier_feature).squeeze(-1)
+                return classifier_logits, start_logits, end_logits
+
         return ReaderModel.from_pretrained(self.hparams.base_pretrained_model, config=config)
 
     def prepare_data(self) -> None:
@@ -150,7 +174,7 @@ class Reader(LightningModule):
 
     @classmethod
     def _collate_fn(
-        cls, batch: List[DatasetExample], hparams: Namespace, fold: str, max_seq_length: int
+            cls, batch: List[DatasetExample], hparams: Namespace, fold: str, max_seq_length: int
     ) -> Dict[str, torch.Tensor]:
         items = []
         example_indices = []
@@ -191,7 +215,7 @@ class Reader(LightningModule):
                 title_token_ids = passage.title_token_ids
 
                 max_passage_seq_length = (
-                    max_seq_length - len(query_token_ids) - len(title_token_ids) - 4
+                        max_seq_length - len(query_token_ids) - len(title_token_ids) - 4
                 )  # [CLS] + [SEP] * 3
                 passage_token_ids = passage_token_ids[:max_passage_seq_length]
                 title_passage_token_ids = title_token_ids + [cls.tokenizer.sep_token_id] + passage_token_ids
@@ -259,7 +283,7 @@ class Reader(LightningModule):
         return self.model(**batch)
 
     def training_step(
-        self, batch: Dict[str, torch.Tensor], batch_idx: int
+            self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor]]]:
         metrics = self._compute_metrics(batch, batch_idx, self._train_dataset, "train")
         loss = (metrics["classifier_loss"] + metrics["span_loss"]) / 3
@@ -277,7 +301,7 @@ class Reader(LightningModule):
         return self._compute_metrics(batch, batch_idx, self._test_dataset, "test")
 
     def _compute_metrics(
-        self, batch: Dict[str, torch.Tensor], batch_idx: int, examples: List[DatasetExample], fold: str
+            self, batch: Dict[str, torch.Tensor], batch_idx: int, examples: List[DatasetExample], fold: str
     ) -> Dict[str, torch.Tensor]:
         input_ids = batch["input_ids"]
         batch_size, num_passages, seq_length = input_ids.size()
@@ -346,7 +370,7 @@ class Reader(LightningModule):
         return self._eval_epoch_end(outputs, "test_", len(self._test_dataset))
 
     def _eval_epoch_end(
-        self, outputs: List[Dict[str, torch.Tensor]], prefix: str, dataset_size: int,
+            self, outputs: List[Dict[str, torch.Tensor]], prefix: str, dataset_size: int,
     ) -> Dict[str, Dict[str, torch.Tensor]]:
         ret = {}
         for name in ("classifier_num_correct", "answer_num_correct"):
@@ -415,12 +439,12 @@ class Reader(LightningModule):
         return parser
 
     def _compute_best_answer_spans(
-        self,
-        input_ids: torch.Tensor,
-        answer_mask: torch.Tensor,
-        start_logits: torch.Tensor,
-        end_logits: torch.Tensor,
-        top_n: int,
+            self,
+            input_ids: torch.Tensor,
+            answer_mask: torch.Tensor,
+            start_logits: torch.Tensor,
+            end_logits: torch.Tensor,
+            top_n: int,
     ) -> List[Tuple[float, int, int]]:
         candidate_spans = [
             (start_logit.item() + end_logit.item(), i, i + j)
@@ -445,21 +469,21 @@ class Reader(LightningModule):
                 continue
 
             if any(
-                start_index <= selected_start_index <= selected_end_index <= end_index
-                or selected_start_index <= start_index <= end_index <= selected_end_index
-                for _, selected_start_index, selected_end_index in selected_spans
+                    start_index <= selected_start_index <= selected_end_index <= end_index
+                    or selected_start_index <= start_index <= end_index <= selected_end_index
+                    for _, selected_start_index, selected_end_index in selected_spans
             ):
                 continue
 
             while (
-                is_subword_id(input_ids[start_index].item()) and start_index > 0 and answer_mask[start_index - 1] == 1
+                    is_subword_id(input_ids[start_index].item()) and start_index > 0 and answer_mask[start_index - 1] == 1
             ):
                 start_index -= 1
 
             while (
-                is_subword_id(input_ids[end_index + 1].item())
-                and end_index < len(answer_mask) - 1
-                and answer_mask[end_index + 1] == 1
+                    is_subword_id(input_ids[end_index + 1].item())
+                    and end_index < len(answer_mask) - 1
+                    and answer_mask[end_index + 1] == 1
             ):
                 end_index += 1
 

@@ -11,6 +11,7 @@ from collections import defaultdict
 from contextlib import closing
 from typing import List
 
+import torch
 import faiss
 import joblib
 import numpy as np
@@ -25,18 +26,13 @@ from bpr.passage_db import PassageDB
 from bpr.retriever import Retriever
 
 logger = logging.getLogger(__name__)
-"""
-python evaluate_retriever.py --binary_k=1000 
---biencoder_file=./training_files/bpr_finetuned_nq.ckpt 
---embedding_file=./training_files/nq_adv_full.emb
---passage_db_file=./lmdb/data.mdb --qa_file=./data/nq-test.qa.csv --batch_size=32
-"""
 
 # https://github.com/facebookresearch/DPR/blob/f403c3b3e179e53c0fe68a0718d5dc25371fe5df/dpr/utils/tokenizers.py#L154
 ALPHA_NUM = r"[\p{L}\p{N}\p{M}]+"
 NON_WS = r"[^\p{Z}\p{C}]"
 # https://github.com/facebookresearch/DPR/blob/f403c3b3e179e53c0fe68a0718d5dc25371fe5df/dpr/utils/tokenizers.py#L163
 REGEXP = regex.compile("(%s)|(%s)" % (ALPHA_NUM, NON_WS), flags=regex.IGNORECASE + regex.UNICODE + regex.MULTILINE)
+
 
 
 def _has_answer(answer: str, passage: str) -> bool:
@@ -76,6 +72,7 @@ if __name__ == "__main__":
     parser.add_argument("--parallel", action="store_true")
     parser.add_argument("--pool_size", type=int, default=multiprocessing.cpu_count())
     parser.add_argument("--chunk_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=32)
 
     args = parser.parse_args()
     logging.basicConfig(
@@ -83,6 +80,23 @@ if __name__ == "__main__":
     )
     logger.setLevel(logging.INFO)
     bpr.index.logger.setLevel(logging.INFO)
+
+    def process_candidates(args):
+        (query, answers), candidates = args
+        passage_dicts = []
+        for index, candidate in enumerate(candidates):
+            passage_dict = dict(id=int(candidate.passage.id), score=float(candidate.score))
+            passage_dict["title"] = candidate.passage.title
+            passage_dict["text"] = candidate.passage.text
+
+            if any(_has_answer(answer, candidate.passage.text) for answer in answers):
+                passage_dict["has_answer"] = True
+            else:
+                passage_dict["has_answer"] = False
+
+            passage_dicts.append(passage_dict)
+
+        return dict(question=query, answers=answers, ctxs=passage_dicts)
 
     passage_db = PassageDB(args.passage_db_file)
     embedding_data = joblib.load(args.embedding_file, mmap_mode="r")
@@ -102,8 +116,15 @@ if __name__ == "__main__":
             index = FaissBinaryIndex.build(ids, embeddings, base_index)
 
         else:
-            base_index = faiss.IndexBinaryFlat(dim_size * 8)
-            index = FaissBinaryIndex.build(ids, embeddings, base_index)
+            #-------
+            if torch.cuda.is_available():
+                base_index = faiss.read_index_binary("./training_files/nq-gpu-full.idx")
+                res = faiss.StandardGpuResources()
+                index = faiss.GpuIndexBinaryFlat(res, base_index)
+                index = FaissBinaryIndex(index,ids,embeddings)
+            else:
+                base_index = faiss.IndexBinaryFlat(dim_size * 8)
+                index = FaissBinaryIndex.build(ids, embeddings, base_index)
 
     elif args.use_hnsw:
         base_index = faiss.IndexHNSWFlat(dim_size + 1, args.hnsw_store_n)
@@ -120,16 +141,8 @@ if __name__ == "__main__":
     del ids
     del embeddings
 
-    with tempfile.NamedTemporaryFile() as f:
-        if isinstance(index, FaissBinaryIndex):
-            faiss.write_index_binary(index.index, f.name)
-        else:
-            faiss.write_index(index.index, f.name)
-
-        logger.info("Index size: %d bytes", os.path.getsize(f.name))
-
     logger.info("Loading BiEncoder...")
-    biencoder = BiEncoder.load_from_checkpoint(args.biencoder_file, map_location="cpu")
+    biencoder = BiEncoder.load_from_checkpoint(args.biencoder_file, map_location="cpu",strict=False)
     biencoder = biencoder.to(args.biencoder_device)
     biencoder.eval()
     biencoder.freeze()
@@ -144,65 +157,58 @@ if __name__ == "__main__":
         qa_pairs = [(row[0], eval(row[1].strip())) for row in csv.reader(f, delimiter="\t")]
     total_count = len(qa_pairs)
 
+
     logger.info("Computing query embeddings...")
     queries = [pair[0] for pair in qa_pairs]
     query_embeddings = retriever.encode_queries(queries)
 
+    def iterator(query_embeddings, qa_pairs, batch_size=args.batch_size):
+        """Yield successive n-sized chunks from lst."""
+        for i in range(0, len(query_embeddings-batch_size), batch_size):
+            yield (query_embeddings[i:i + batch_size],qa_pairs[i:i + batch_size])
+
     logger.info("Getting top-k results...")
-    start_time = time.time()
-    if isinstance(index, FaissBinaryIndex):
-        topk_results = retriever.search(
-            query_embeddings, max(args.top_k), binary_k=args.binary_k, rerank=not args.binary_no_rerank
-        )
-    else:
-        topk_results = retriever.search(query_embeddings, max(args.top_k))
-    query_time = time.time() - start_time
-    logger.info("Elapsed time: %.2fsec", query_time)
-    logger.info("Queries per sec: %.2f", total_count / query_time)
 
-    del biencoder
-    del retriever
+    #if args.output_file:
+    #with open(args.output_file, "w") as file:
+    total_correct_counts = defaultdict(int)
+    for batch in iterator(query_embeddings, qa_pairs):
+        start_time = time.time()
+        if isinstance(index, FaissBinaryIndex):
+            topk_results = retriever.search(
+                batch[0], max(args.top_k), binary_k=args.binary_k, rerank=not args.binary_no_rerank
+            )
+        else:
+            topk_results = retriever.search(batch[0], max(args.top_k))
+        query_time = time.time() - start_time
+        logger.info("Elapsed time: %.2fsec", query_time)
+        logger.info("Queries per sec: %.2f", total_count / query_time)
 
-    def process_candidates(args):
-        (query, answers), candidates = args
-        passage_dicts = []
-        for index, candidate in enumerate(candidates):
-            passage_dict = dict(id=int(candidate.passage.id), score=float(candidate.score))
-            passage_dict["title"] = candidate.passage.title
-            passage_dict["text"] = candidate.passage.text
+        logger.info("Computing evaluation metrics...")
 
-            if any(_has_answer(answer, candidate.passage.text) for answer in answers):
-                passage_dict["has_answer"] = True
-            else:
-                passage_dict["has_answer"] = False
+        correct_counts = defaultdict(int)
+        output_examples = []
+        with tqdm(total=len(batch[1])) as pbar:
+            with closing(multiprocessing.Pool(args.pool_size)) as pool:
+                for example in pool.imap(process_candidates, zip(batch[1], topk_results), chunksize=args.chunk_size):
+                    output_examples.append(example)
+                    for i, passage_dict in enumerate(example["ctxs"]):
+                        if passage_dict["has_answer"]:
+                            for top_k in args.top_k:
+                                if i < top_k:
+                                    correct_counts[top_k] += 1
+                            break
 
-            passage_dicts.append(passage_dict)
+                    pbar.update()
 
-        return dict(question=query, answers=answers, ctxs=passage_dicts)
-
-    logger.info("Computing evaluation metrics...")
-
-    correct_counts = defaultdict(int)
-    output_examples = []
-    with tqdm(total=len(qa_pairs)) as pbar:
-        with closing(multiprocessing.Pool(args.pool_size)) as pool:
-            for example in pool.imap(process_candidates, zip(qa_pairs, topk_results), chunksize=args.chunk_size):
-                output_examples.append(example)
-                for index, passage_dict in enumerate(example["ctxs"]):
-                    if passage_dict["has_answer"]:
-                        for top_k in args.top_k:
-                            if index < top_k:
-                                correct_counts[top_k] += 1
-                        break
-
-                pbar.update()
-
+        if not args.no_eval:
+            logger.info("#total examples: %d", args.batch_size)
+            for top_k in args.top_k:
+                precision = correct_counts[top_k] / args.batch_size
+                total_correct_counts[top_k]+=correct_counts[top_k]
+                logger.info("precision@%d:%f correct_samples:%d", top_k, precision, correct_counts[top_k])
     if not args.no_eval:
         logger.info("#total examples: %d", total_count)
         for top_k in args.top_k:
-            precision = correct_counts[top_k] / total_count
-            logger.info("precision@%d:%f correct_samples:%d", top_k, precision, correct_counts[top_k])
-
-    if args.output_file:
-        with open(args.output_file, "w") as f:
-            json.dump(output_examples, f, ensure_ascii=False, indent=2)
+            precision = total_correct_counts[top_k] / total_count
+            logger.info("precision@%d:%f correct_samples:%d", top_k, precision, total_correct_counts[top_k])

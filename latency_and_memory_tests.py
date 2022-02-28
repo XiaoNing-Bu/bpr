@@ -82,7 +82,7 @@ if __name__ == "__main__":
     parser.add_argument("--index_device", type=str, default="cpu", choices=["cuda", "cpu"])
     parser.add_argument("--parallel", action="store_true")
     parser.add_argument("--pool_size", type=int, default=multiprocessing.cpu_count())
-    parser.add_argument("--chunk_size", type=int, default=32)
+    parser.add_argument("--chunk_size", type=int, default=64)
     parser.add_argument("--retriever_batch_size", type=int, default=32)
     parser.add_argument("--reader_batch_size", type=int, default=100)
 
