@@ -34,7 +34,8 @@ class BiEncoderModel(BertModel):
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
         sequence_output = super().forward(*args, **kwargs)[0]
-        cls_output = sequence_output[:, 0, :].contiguous()
+        #cls_output = sequence_output[:, 0, :].contiguous()
+        cls_output = sequence_output.contiguous()
         if getattr(self.hparams, "projection_dim_size", None) is not None:
             cls_output = self.layer_norm(self.dense(cls_output))
 

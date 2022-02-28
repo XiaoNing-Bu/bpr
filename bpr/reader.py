@@ -23,6 +23,7 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
 )
+from .biencoder import BiEncoder
 
 from .reader_dataset import DatasetExample, ReaderDataset
 
@@ -45,16 +46,23 @@ class Reader(LightningModule):
         class ReaderModel(base_class):
             def __init__(self, config: PretrainedConfig):
                 super().__init__(config)
+                print("!!!!!!!!!!!!!!!!!!!!!!start init!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                 self.qa_outputs = nn.Linear(config.hidden_size, 2)
                 self.qa_classifier = nn.Linear(config.hidden_size, 1)
-
                 self.init_weights()
-
+                biencoder = BiEncoder.load_from_checkpoint("bpr_finetuned_nq.ckpt", map_location="cuda", strict=False)
+                self.passage_encoder = biencoder.passage_encoder
+                for param in self.passage_encoder.parameters():
+                    param.requires_grad = False
+                print("!!!!!!!!!!!!!!!!!!!!! end init !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             def forward(
-                self, input_ids: torch.Tensor, token_type_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs
+                    self, input_ids: torch.Tensor, token_type_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs
             ) -> Tuple[torch.Tensor, ...]:
+                print("!!!!!!!!!!!!!!!!!!!!!!start forward!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                with torch.no_grad():
+                    inputs_embeds = self.passage_encoder(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)
                 outputs = super().forward(
-                    input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask
+                    input_ids=inputs_embeds
                 )
                 sequence_output = outputs[0]
 
@@ -64,15 +72,16 @@ class Reader(LightningModule):
 
                 classifier_feature = sequence_output[:, 0, :]
                 classifier_logits = self.qa_classifier(classifier_feature).squeeze(-1)
-
+                print("!!!!!!!!!!!!!!!!!!!!!!end forward!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                 return classifier_logits, start_logits, end_logits
-
         return ReaderModel.from_pretrained(self.hparams.base_pretrained_model, config=config)
 
     def prepare_data(self) -> None:
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!prepare_data start!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         ReaderDataset.load_dataset(
             self.hparams.train_file, self.hparams.base_pretrained_model, "train", self.hparams.nq_gold_train_file
         )
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!prepare_data train end!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         ReaderDataset.load_dataset(
             self.hparams.validation_file,
             self.hparams.base_pretrained_model,
@@ -85,6 +94,7 @@ class Reader(LightningModule):
             "test",
             getattr(self.hparams, "nq_gold_test_file", ""),
         )
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!prepare_data end!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 
     def setup(self, step: str) -> None:
         if step == "test":

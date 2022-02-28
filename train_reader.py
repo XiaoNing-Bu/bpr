@@ -25,7 +25,8 @@ if __name__ == "__main__":
     hparams = parser.parse_args()
 
     pl.seed_everything(hparams.seed)
-
+    #----------------------------------------------------------------
+    hparams.base_pretrained_model="google/bert_uncased_L-4_H-768_A-12"
     checkpoint_callback = ModelCheckpoint(save_last=True, save_top_k=1, monitor="val_answer_acc", mode="max")
 
     logger = TensorBoardLogger(save_dir=hparams.output_dir, name=hparams.tensorboard_name)
@@ -38,9 +39,13 @@ if __name__ == "__main__":
             auto_output_logging=False,
         )
         logger = [logger, comet_logger]
-
+    """
     trainer = Trainer.from_argparse_args(
         hparams, logger=logger, checkpoint_callback=checkpoint_callback, early_stop_callback=False,
+    )
+    """
+    trainer = Trainer.from_argparse_args(
+        hparams, logger=logger, checkpoint_callback=checkpoint_callback
     )
 
     model = Reader(hparams)
@@ -48,4 +53,3 @@ if __name__ == "__main__":
     trainer.fit(model)
     time.sleep(60)
     trainer.test()
-
